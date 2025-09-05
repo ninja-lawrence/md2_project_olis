@@ -26,18 +26,20 @@ enriched_orders AS (
   SELECT
     oi.*, -- All columns from order_items_base
     
-    -- Customer key from orders table
-    o.customer_id as customer_key,
-    
+    -- Customer key from customers table (using customer_unique_id)
+    c.customer_unique_id as customer_key,
     -- Date key for temporal analysis
     FORMAT_DATE('%Y-%m-%d', o.order_purchase_timestamp) as date_key
     
   FROM order_items_base oi
   INNER JOIN {{ ref('stg_orders') }} o
     ON oi.order_key = o.order_id
+  INNER JOIN {{ ref('stg_customers') }} c
+    ON o.customer_id = c.customer_id
   WHERE o.customer_id IS NOT NULL
     AND o.order_purchase_timestamp IS NOT NULL
-),
+    AND c.customer_unique_id IS NOT NULL
+  ),
 
 final_fact AS (
   SELECT

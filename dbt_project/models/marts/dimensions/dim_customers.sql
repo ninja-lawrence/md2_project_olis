@@ -1,18 +1,20 @@
 WITH customer_base AS (
   SELECT
-    -- Primary key
-    customer_id as customer_key,
+    -- Primary key (using customer_unique_id as the unique identifier)
+    customer_unique_id as customer_key,
     
-    -- Customer identifiers
-    customer_unique_id,
-    
-    -- Location data (cleaned from staging)
-    customer_city,
-    customer_state,
-    customer_zip_prefix
+    -- Customer identifiers (take any customer_id for each unique customer)
+    ANY_VALUE(customer_id) as customer_id_original,
+
+    -- Location data (cleaned from staging - should be consistent for each customer)
+    ANY_VALUE(customer_city) as customer_city,
+    ANY_VALUE(customer_state) as customer_state,
+    ANY_VALUE(customer_zip_prefix) as customer_zip_prefix
     
   FROM {{ ref('stg_customers') }}
   WHERE customer_id IS NOT NULL
+      AND customer_unique_id IS NOT NULL
+  GROUP BY customer_unique_id
 ),
 
 customer_regions AS (
