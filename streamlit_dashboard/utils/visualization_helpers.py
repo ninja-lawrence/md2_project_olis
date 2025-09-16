@@ -472,6 +472,10 @@ def create_regional_heatmap(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return go.Figure()
     
+    # Ensure 'total_sales' is float to avoid Decimal errors
+    df = df.copy()
+    df['total_sales'] = df['total_sales'].astype(float)
+
     # Pivot data for heatmap
     pivot_df = df.pivot(
         index='customer_region', 

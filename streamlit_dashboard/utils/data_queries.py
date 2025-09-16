@@ -8,10 +8,42 @@ import pandas as pd
 from typing import Optional, Dict, Any, Tuple
 from .bigquery_client import execute_query, init_connection
 import logging
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- Load .env (prefer .env, fallback to .env.sample / env_sample) ---
+root_dir = Path(__file__).resolve().parents[2]  # go up 2 levels
+env_candidates = [root_dir / ".env", root_dir / ".env.sample", root_dir / "env_sample"]
+
+for p in env_candidates:
+    if p.exists():
+        load_dotenv(dotenv_path=p)
+        logger.info("Loaded environment variables from %s", p)
+        break
+else:
+    logger.warning("No .env file found; relying on existing environment variables")
+
+PROJECT_ID = os.getenv("PROJECT_ID")  # or your project var
+# --- Resolve marts dataset name robustly ---
+RAW_NAME = os.getenv("MARTS_DATASET_NAME", "").strip()
+
+def ensure_marts_suffix(name: str) -> str:
+    """Append '_marts' only if not already present; raise if empty."""
+    if not name:
+        raise EnvironmentError("MARTS_DATASET_NAME is not set (or empty).")
+    return name if name.endswith("_marts") else f"{name}_marts"
+
+try:
+    marts_dataset = ensure_marts_suffix(RAW_NAME)
+except EnvironmentError as e:
+    # You can choose to default or hard-fail; here we hard-fail loudly.
+    logger.error(str(e))
+    raise
 
 @st.cache_data(ttl=600)
 def get_monthly_sales_trends(year_filter: Optional[str] = None, region_filter: Optional[str] = None) -> pd.DataFrame:
@@ -47,9 +79,9 @@ def get_monthly_sales_trends(year_filter: Optional[str] = None, region_filter: O
             ROUND(SUM(f.payment_value), 2) as total_payments,
             ROUND(SUM(f.total_item_value) / COUNT(DISTINCT f.order_key), 2) as avg_order_value,
             ROUND(SUM(f.payment_value) / COUNT(DISTINCT f.order_key), 2) as avg_payment_value
-        FROM `olist_marts.fact_sales` f
-        JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key
-        JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
+        JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key
+        JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key
         WHERE 1=1 {year_condition} {region_condition}
         GROUP BY d.year, d.month, d.month_name
         ORDER BY d.year, d.month
@@ -78,14 +110,14 @@ def get_top_products_categories(limit: int = 20, year_filter: Optional[str] = No
         # Build query with optional filters
         year_condition = ""
         region_condition = ""
-        joins = ["JOIN `olist_marts.dim_products` p ON f.product_key = p.product_key"]
+        joins = [f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_products` p ON f.product_key = p.product_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             year_condition = f"AND d.year = {year_filter}"
             
         if region_filter and region_filter != "All Regions":
-            joins.append("JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key")
             region_condition = f"AND c.customer_region = '{region_filter}'"
         
         query = f"""
@@ -97,7 +129,7 @@ def get_top_products_categories(limit: int = 20, year_filter: Optional[str] = No
             ROUND(AVG(f.total_item_value), 2) as avg_item_value,
             ROUND(SUM(f.freight_value), 2) as total_freight,
             ROUND(SUM(f.item_price), 2) as total_item_price
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         WHERE p.product_category_english IS NOT NULL {year_condition} {region_condition}
         GROUP BY p.product_category_english
@@ -126,12 +158,12 @@ def get_sales_by_region(year_filter: Optional[str] = None) -> pd.DataFrame:
         # Build query with optional year filter
         year_condition = ""
         joins = [
-            "JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key",
-            "JOIN `olist_marts.dim_sellers` s ON f.seller_key = s.seller_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_sellers` s ON f.seller_key = s.seller_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             year_condition = f"AND d.year = {year_filter}"
         
         query = f"""
@@ -144,7 +176,7 @@ def get_sales_by_region(year_filter: Optional[str] = None) -> pd.DataFrame:
             ROUND(AVG(f.total_item_value), 2) as avg_order_value,
             COUNT(DISTINCT c.customer_key) as unique_customers,
             COUNT(DISTINCT s.seller_key) as unique_sellers
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         WHERE c.customer_region IS NOT NULL AND s.seller_region IS NOT NULL {year_condition}
         GROUP BY c.customer_region, s.seller_region
@@ -172,10 +204,10 @@ def get_sales_by_state(year_filter: Optional[str] = None, region_filter: Optiona
     try:
         # Build query with optional filters
         conditions = ["c.customer_state IS NOT NULL"]
-        joins = ["JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key"]
+        joins = [f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -192,7 +224,7 @@ def get_sales_by_state(year_filter: Optional[str] = None, region_filter: Optiona
             ROUND(SUM(f.total_item_value), 2) as total_sales,
             ROUND(AVG(f.total_item_value), 2) as avg_order_value,
             COUNT(DISTINCT c.customer_key) as unique_customers
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY c.customer_state, c.customer_region
@@ -220,12 +252,12 @@ def get_customer_seller_flow(year_filter: Optional[str] = None) -> pd.DataFrame:
         # Build query with optional year filter
         year_condition = ""
         joins = [
-            "JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key",
-            "JOIN `olist_marts.dim_sellers` s ON f.seller_key = s.seller_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_sellers` s ON f.seller_key = s.seller_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             year_condition = f"AND d.year = {year_filter}"
         
         query = f"""
@@ -240,7 +272,7 @@ def get_customer_seller_flow(year_filter: Optional[str] = None) -> pd.DataFrame:
             ROUND(SUM(f.total_item_value), 2) as total_sales,
             COUNT(DISTINCT c.customer_key) as unique_customers,
             COUNT(DISTINCT s.seller_key) as unique_sellers
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         WHERE c.customer_region IS NOT NULL AND s.seller_region IS NOT NULL {year_condition}
         GROUP BY 
@@ -293,9 +325,9 @@ def get_customer_behavior(year_filter: Optional[str] = None, region_filter: Opti
                 d.full_date,
                 SUM(f.total_item_value) as order_total_value,
                 COUNT(f.order_item_sk) as items_in_order
-            FROM `olist_marts.fact_sales` f
-            JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key
-            JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key
+            FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
+            JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key
+            JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key
             {where_clause}
             GROUP BY f.order_key, c.customer_key, c.customer_region, d.full_date
         ),
@@ -364,9 +396,9 @@ def get_customer_segmentation(year_filter: Optional[str] = None, region_filter: 
                 ROUND(SUM(f.total_item_value), 2) as total_spent,
                 ROUND(AVG(f.total_item_value), 2) as avg_order_value,
                 DATE_DIFF(MAX(d.full_date), MIN(d.full_date), DAY) as customer_lifetime_days
-            FROM `olist_marts.fact_sales` f
-            JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key
-            JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key
+            FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
+            JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key
+            JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key
             {where_clause}
             GROUP BY c.customer_key, c.customer_region
         ),
@@ -435,9 +467,9 @@ def get_customer_frequency_analysis(year_filter: Optional[str] = None, region_fi
                 c.customer_key,
                 COUNT(DISTINCT f.order_key) as order_count,
                 ROUND(SUM(f.total_item_value), 2) as total_spent
-            FROM `olist_marts.fact_sales` f
-            JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key
-            JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key
+            FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
+            JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key
+            JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key
             {where_clause}
             GROUP BY c.customer_key
         )
@@ -473,14 +505,14 @@ def get_payment_analysis(year_filter: Optional[str] = None, region_filter: Optio
     try:
         # Build query with optional filters
         conditions = []
-        joins = ["JOIN `olist_marts.dim_payments` p ON f.payment_key = p.payment_key"]
+        joins = [f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_payments` p ON f.payment_key = p.payment_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
-            joins.append("JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key")
             conditions.append(f"c.customer_region = '{region_filter}'")
         
         where_clause = ""
@@ -499,7 +531,7 @@ def get_payment_analysis(year_filter: Optional[str] = None, region_filter: Optio
             SUM(CASE WHEN p.uses_voucher THEN 1 ELSE 0 END) as voucher_orders,
             ROUND(SUM(f.payment_value), 2) as total_payments,
             ROUND(AVG(p.payment_methods_count), 1) as avg_payment_methods_count
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY p.primary_payment_type
@@ -527,14 +559,14 @@ def get_installment_analysis(year_filter: Optional[str] = None, region_filter: O
     try:
         # Build query with optional filters
         conditions = []
-        joins = ["JOIN `olist_marts.dim_payments` p ON f.payment_key = p.payment_key"]
+        joins = [f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_payments` p ON f.payment_key = p.payment_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
-            joins.append("JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key")
             conditions.append(f"c.customer_region = '{region_filter}'")
         
         where_clause = ""
@@ -550,7 +582,7 @@ def get_installment_analysis(year_filter: Optional[str] = None, region_filter: O
             ROUND(SUM(f.payment_value), 2) as total_payments,
             ROUND(AVG(f.payment_value), 2) as avg_payment_value,
             ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) as percentage_of_orders
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY p.total_installments
@@ -578,10 +610,10 @@ def get_seller_performance(year_filter: Optional[str] = None, region_filter: Opt
     try:
         # Build query with optional filters
         conditions = ["s.seller_region IS NOT NULL"]
-        joins = ["JOIN `olist_marts.dim_sellers` s ON f.seller_key = s.seller_key"]
+        joins = [f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_sellers` s ON f.seller_key = s.seller_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -601,7 +633,7 @@ def get_seller_performance(year_filter: Optional[str] = None, region_filter: Opt
             COUNT(DISTINCT f.product_key) as unique_products_sold,
             ROUND(AVG(f.freight_value), 2) as avg_freight_value,
             ROUND(SUM(f.freight_value), 2) as total_freight_revenue
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY s.seller_region
@@ -630,10 +662,10 @@ def get_top_sellers(limit: int = 20, year_filter: Optional[str] = None, region_f
     try:
         # Build query with optional filters
         conditions = ["s.seller_region IS NOT NULL"]
-        joins = ["JOIN `olist_marts.dim_sellers` s ON f.seller_key = s.seller_key"]
+        joins = [f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_sellers` s ON f.seller_key = s.seller_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -654,7 +686,7 @@ def get_top_sellers(limit: int = 20, year_filter: Optional[str] = None, region_f
             COUNT(DISTINCT f.product_key) as unique_products_sold,
             ROUND(SUM(f.freight_value), 2) as total_freight_revenue,
             COUNT(DISTINCT f.customer_key) as unique_customers_served
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY s.seller_key, s.seller_region, s.seller_state, s.seller_city
@@ -684,12 +716,12 @@ def get_seller_product_diversity(year_filter: Optional[str] = None, region_filte
         # Build query with optional filters
         conditions = ["s.seller_region IS NOT NULL", "p.product_category_english IS NOT NULL"]
         joins = [
-            "JOIN `olist_marts.dim_sellers` s ON f.seller_key = s.seller_key",
-            "JOIN `olist_marts.dim_products` p ON f.product_key = p.product_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_sellers` s ON f.seller_key = s.seller_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_products` p ON f.product_key = p.product_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -705,7 +737,7 @@ def get_seller_product_diversity(year_filter: Optional[str] = None, region_filte
                 COUNT(DISTINCT p.product_category_english) as category_count,
                 COUNT(DISTINCT f.product_key) as product_count,
                 ROUND(SUM(f.total_item_value), 2) as total_revenue
-            FROM `olist_marts.fact_sales` f
+            FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
             {' '.join(joins)}
             {where_clause}
             GROUP BY s.seller_region, s.seller_key
@@ -744,14 +776,14 @@ def get_reviews_sales_correlation(year_filter: Optional[str] = None, region_filt
     try:
         # Build query with optional filters
         conditions = []
-        joins = ["LEFT JOIN `olist_marts.dim_reviews` r ON f.review_key = r.review_key"]
+        joins = [f"LEFT JOIN `{PROJECT_ID}.{marts_dataset}.dim_reviews` r ON f.review_key = r.review_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
-            joins.append("JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key")
             conditions.append(f"c.customer_region = '{region_filter}'")
         
         where_clause = ""
@@ -773,7 +805,7 @@ def get_reviews_sales_correlation(year_filter: Optional[str] = None, region_filt
             COUNT(r.review_key) as reviews_count,
             COUNT(*) - COUNT(r.review_key) as no_review_count,
             COUNT(DISTINCT f.order_key) as total_orders
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY 
@@ -807,14 +839,14 @@ def get_review_score_distribution(year_filter: Optional[str] = None, region_filt
     try:
         # Build query with optional filters
         conditions = []
-        joins = ["LEFT JOIN `olist_marts.dim_reviews` r ON f.review_key = r.review_key"]
+        joins = [f"LEFT JOIN `{PROJECT_ID}.{marts_dataset}.dim_reviews` r ON f.review_key = r.review_key"]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
-            joins.append("JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key")
             conditions.append(f"c.customer_region = '{region_filter}'")
         
         where_clause = ""
@@ -830,7 +862,7 @@ def get_review_score_distribution(year_filter: Optional[str] = None, region_filt
             COUNT(DISTINCT f.order_key) as total_orders,
             COUNT(r.review_key) as actual_reviews,
             ROUND(COUNT(f.order_item_sk) * 100.0 / SUM(COUNT(f.order_item_sk)) OVER(), 1) as percentage_of_items
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY COALESCE(r.review_score, 0)
@@ -859,16 +891,16 @@ def get_review_timing_analysis(year_filter: Optional[str] = None, region_filter:
         # Build query with optional filters
         conditions = ["r.review_key IS NOT NULL"]  # Only analyze actual reviews
         joins = [
-            "JOIN `olist_marts.dim_reviews` r ON f.review_key = r.review_key",
-            "JOIN `olist_marts.dim_orders` o ON f.order_key = o.order_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_reviews` r ON f.review_key = r.review_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_orders` o ON f.order_key = o.order_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
-            joins.append("JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key")
             conditions.append(f"c.customer_region = '{region_filter}'")
         
         where_clause = "WHERE " + " AND ".join(conditions)
@@ -886,7 +918,7 @@ def get_review_timing_analysis(year_filter: Optional[str] = None, region_filter:
                     WHEN r.days_to_review <= 90 THEN 'Delayed (31-90 days)'
                     ELSE 'Very Late (>90 days)'
                 END as timing_category
-            FROM `olist_marts.fact_sales` f
+            FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
             {' '.join(joins)}
             {where_clause}
             AND r.days_to_review IS NOT NULL
@@ -925,12 +957,12 @@ def get_delivery_patterns(year_filter: Optional[str] = None, region_filter: Opti
         # Build query with optional filters
         conditions = ["o.days_to_delivery IS NOT NULL"]
         joins = [
-            "JOIN `olist_marts.dim_orders` o ON f.order_key = o.order_key",
-            "JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_orders` o ON f.order_key = o.order_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -955,7 +987,7 @@ def get_delivery_patterns(year_filter: Optional[str] = None, region_filter: Opti
             ROUND(MIN(o.days_to_delivery), 1) as min_delivery_days,
             ROUND(MAX(o.days_to_delivery), 1) as max_delivery_days,
             ROUND(STDDEV(o.days_to_delivery), 1) as delivery_days_stddev
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY c.customer_region
@@ -984,12 +1016,12 @@ def get_delivery_time_distribution(year_filter: Optional[str] = None, region_fil
         # Build query with optional filters
         conditions = ["o.days_to_delivery IS NOT NULL"]
         joins = [
-            "JOIN `olist_marts.dim_orders` o ON f.order_key = o.order_key",
-            "JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_orders` o ON f.order_key = o.order_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -1016,7 +1048,7 @@ def get_delivery_time_distribution(year_filter: Optional[str] = None, region_fil
                 1
             ) as on_time_rate,
             ROUND(AVG(o.delivery_vs_estimate_days), 1) as avg_vs_estimate
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY 
@@ -1052,13 +1084,13 @@ def get_delivery_efficiency_analysis(year_filter: Optional[str] = None, region_f
         # Build query with optional filters
         conditions = ["o.days_to_delivery IS NOT NULL"]
         joins = [
-            "JOIN `olist_marts.dim_orders` o ON f.order_key = o.order_key",
-            "JOIN `olist_marts.dim_customers` c ON f.customer_key = c.customer_key",
-            "JOIN `olist_marts.dim_sellers` s ON f.seller_key = s.seller_key"
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_orders` o ON f.order_key = o.order_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_customers` c ON f.customer_key = c.customer_key",
+            f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_sellers` s ON f.seller_key = s.seller_key"
         ]
         
         if year_filter and year_filter != "All Years":
-            joins.append("JOIN `olist_marts.dim_date` d ON f.date_key = d.date_key")
+            joins.append(f"JOIN `{PROJECT_ID}.{marts_dataset}.dim_date` d ON f.date_key = d.date_key")
             conditions.append(f"d.year = {year_filter}")
             
         if region_filter and region_filter != "All Regions":
@@ -1083,7 +1115,7 @@ def get_delivery_efficiency_analysis(year_filter: Optional[str] = None, region_f
             ) as on_time_rate,
             ROUND(SUM(f.total_item_value), 2) as total_sales,
             ROUND(AVG(f.freight_value), 2) as avg_freight_cost
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         {' '.join(joins)}
         {where_clause}
         GROUP BY c.customer_region, s.seller_region, 
@@ -1118,7 +1150,7 @@ def get_dashboard_summary() -> Dict[str, Any]:
             COUNT(DISTINCT f.customer_key) as unique_customers,
             COUNT(DISTINCT f.seller_key) as unique_sellers,
             COUNT(DISTINCT f.product_key) as unique_products
-        FROM `olist_marts.fact_sales` f
+        FROM `{PROJECT_ID}.{marts_dataset}.fact_sales` f
         """
         
         summary_df = execute_query(summary_query)
@@ -1162,7 +1194,7 @@ def validate_marts_data() -> Dict[str, bool]:
     
     for table in required_tables:
         try:
-            query = f"SELECT COUNT(*) as count FROM `olist_marts.{table}`"
+            query = f"SELECT COUNT(*) as count FROM `{PROJECT_ID}.{marts_dataset}.{table}`"
             result = execute_query(query)
             validation_results[table] = len(result) > 0 and result.iloc[0]['count'] > 0
         except Exception as e:
